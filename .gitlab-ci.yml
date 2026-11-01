@@ -1,0 +1,143 @@
+# Generic Container Hardening & Air-Gap Packaging Pipeline
+# Drop into any GitLab repo. Configure via CI/CD variables (see README.md).
+
+stages:
+  - setup
+  - build
+  - scan
+  - approve
+  - zarf-package
+
+variables:
+  REGISTRY_URL: "${CI_REGISTRY}"
+  DOCKER_IMAGE: "${REGISTRY_URL}/opensource/docker/docker:24.0.5"
+  DOCKER_DIND_IMAGE: "${REGISTRY_URL}/opensource/docker/docker-dind:24.0.5"
+  BASE_IMAGE: "registry.access.redhat.com/ubi8/ubi:latest"
+  IMAGE_NAME: "${CI_REGISTRY_IMAGE}"
+  IMAGE_TAG: "${CI_COMMIT_SHA}"
+  HARDENING_MANIFEST_PATH: "hardening_manifest.yaml"
+  ANCHORE_POLICY_PATH: "config/anchore_policy.json"
+  OPENSCAP_PROFILE: "xccdf_mil.disa.stig_profile_standard"
+  OPENSCAP_DATASTREAM: "/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml"
+  ENABLE_ANCHORE: "true"
+  ENABLE_PRISMA: "true"
+  ENABLE_OPENSCAP: "true"
+  ENABLE_TRIVY: "true"
+  ENABLE_ZARF: "true"
+  ENABLE_SIGNING: "true"
+  FAIL_ON_CRITICAL: "true"
+  FAIL_ON_HIGH: "true"
+  COSIGN_KEY: ""
+  COSIGN_KEYLESS: "false"
+  PRISMA_URL: ""
+  PRISMA_USER: ""
+  PRISMA_PASS: ""
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  IL_LEVEL: "IL6"
+  ZARF_IMAGE: "${REGISTRY_URL}/opensource/zarf/zarf:v0.31.0"
+
+.base_job_template:
+  image: ${DOCKER_IMAGE}
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
+
+setup-dependencies:
+  stage: setup
+  extends: .base_job_template
+  tags: [egress]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - echo "[$IL_LEVEL] Validating manifest at ${HARDENING_MANIFEST_PATH}..."
+    - |
+      if [ -f "${HARDENING_MANIFEST_PATH}" ]; then
+        python3 ./scripts/lint_manifest.py --manifest "${HARDENING_MANIFEST_PATH}"
+        python3 ./scripts/import_artifacts.py --manifest "${HARDENING_MANIFEST_PATH}"
+      else
+        echo "No hardening manifest found — skipping download."
+      fi
+  artifacts:
+    expire_in: 7 days
+    paths: [downloaded_artifacts/]
+
+build-container:
+  stage: build
+  extends: .base_job_template
+  tags: [airgap]
+  dependencies: [setup-dependencies]
+  script:
+    - echo "[$IL_LEVEL] Building image ${IMAGE_NAME}:${IMAGE_TAG} from base ${BASE_IMAGE}..."
+    - mkdir -p downloaded_artifacts
+    - docker build --no-cache --build-arg BASE_IMAGE="${BASE_IMAGE}" -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+    - docker save "${IMAGE_NAME}:${IMAGE_TAG}" -o container_image.tar
+  artifacts:
+    expire_in: 7 days
+    paths: [container_image.tar]
+
+scan-trivy:
+  stage: scan
+  extends: .base_job_template
+  tags: [airgap]
+  dependencies: [build-container]
+  rules:
+    - if: '$ENABLE_TRIVY == "true"'
+  script:
+    - echo "[$IL_LEVEL] Trivy vulnerability + license scan..."
+    - |
+      SEVERITY=""
+      [ "${FAIL_ON_CRITICAL}" = "true" ] && SEVERITY="CRITICAL"
+      [ "${FAIL_ON_HIGH}" = "true" ] && SEVERITY="${SEVERITY:+$SEVERITY,}HIGH"
+      [ -z "$SEVERITY" ] && SEVERITY="CRITICAL,HIGH"
+      trivy image --format json --output trivy.json --severity "$SEVERITY" --exit-code 1 --scanners vuln,license "${IMAGE_NAME}:${IMAGE_TAG}" || true
+  artifacts:
+    expire_in: 7 days
+    paths: [trivy.json]
+    reports:
+      container_scanning: trivy.json
+    when: always
+
+approve-and-sign:
+  stage: approve
+  extends: .base_job_template
+  tags: [airgap]
+  dependencies: [build-container, scan-trivy]
+  rules:
+    - if: '$ENABLE_SIGNING == "true"'
+  script:
+    - echo "[$IL_LEVEL] Generating SBOM..."
+    - syft "${IMAGE_NAME}:${IMAGE_TAG}" -o spdx-json > sbom.spdx.json
+    - echo "[$IL_LEVEL] Running SBOM / license / FOCI gates..."
+    - python3 ./scripts/check_sbom_gates.py --sbom sbom.spdx.json --trivy trivy.json --denylist config/foreign_origin_denylist.txt
+    - |
+      if [ "${COSIGN_KEYLESS}" = "true" ]; then
+        cosign sign --yes "${IMAGE_NAME}:${IMAGE_TAG}"
+      elif [ -n "${COSIGN_KEY}" ]; then
+        cosign sign --key "${COSIGN_KEY}" "${IMAGE_NAME}:${IMAGE_TAG}"
+      else
+        echo "No signing method configured. Skipping sign."
+      fi
+  artifacts:
+    expire_in: 7 days
+    paths: [sbom.spdx.json, trivy.json]
+    reports:
+      container_scanning: trivy.json
+    when: always
+
+zarf-package-create:
+  stage: zarf-package
+  image: ${ZARF_IMAGE}
+  tags: [airgap]
+  dependencies: [build-container, approve-and-sign]
+  rules:
+    - if: '$ENABLE_ZARF == "true"'
+  script:
+    - docker load -i container_image.tar || true
+    - python3 ./scripts/generate_zarf.py
+    - zarf package create --confirm
+  artifacts:
+    expire_in: 30 days
+    paths: [zarf-package-*.tar.zst]

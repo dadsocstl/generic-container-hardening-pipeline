@@ -1,0 +1,4 @@
+# FOCI / restricted-origin denylist
+# One entry per line (package name or purl prefix). # = comment.
+# log4j-core
+# pkg:npm/some-restricted-package
